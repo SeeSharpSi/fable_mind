@@ -94,6 +94,17 @@ go run .
 
 The application will be available at `http://localhost:9779`.
 
+### Run with Podman
+
+Build the image and pass API configuration at runtime:
+
+```bash
+podman build -t story-ai .
+podman run --rm --name story-ai -p 9779:9779 --env-file .env story-ai
+```
+
+The image contains the bundled `data.db`; `.env` is excluded from the image.
+
 ## 🎮 How to Play
 
 1.  Open your web browser to `http://localhost:9779`.

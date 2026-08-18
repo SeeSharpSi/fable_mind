@@ -1,37 +1,35 @@
-# --- Builder Stage ---
+# syntax=docker/dockerfile:1
+
 FROM golang:1.24-alpine AS builder
 
-# Set the working directory inside the container
-WORKDIR /app
+WORKDIR /src
 
-# Copy go.mod and go.sum to download dependencies
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy the rest of the source code
 COPY . .
 
-# Build the Go application
-# CGO_ENABLED=0 builds a static binary
-# -o /app/server builds the output to /app/server
-RUN CGO_ENABLED=0 GOOS=linux go build -o /app/server .
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/story-ai .
 
-# --- Final Stage ---
-FROM alpine:latest
+FROM alpine:3.22
 
-# Set the working directory inside the container
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S app \
+    && adduser -S -G app app
+
 WORKDIR /app
 
-# Copy the built binary from the builder stage
-COPY --from=builder /app/server .
+COPY --from=builder --chown=app:app /out/story-ai ./story-ai
+COPY --chown=app:app static/ ./static/
+COPY --chown=app:app data.db ./data.db
 
-# Copy static files and templates
-COPY static ./static
-COPY templates ./templates
-COPY data.db .
+ENV PORT=9779
 
-# Expose the port the app runs on
 EXPOSE 9779
 
-# Command to run the executable
-CMD ["./server"]
+USER app
+
+ENTRYPOINT ["/app/story-ai"]

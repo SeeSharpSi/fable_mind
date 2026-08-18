@@ -1,0 +1,7 @@
+.git
+.env
+.env.*
+!.env.example
+cmd_test/
+*.log
+coverage.out
