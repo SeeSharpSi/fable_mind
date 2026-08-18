@@ -1,6 +1,6 @@
 # Fable Mind 🤖✍️
 
-**Fable Mind is an interactive, text-based adventure game powered by Gemini or an OpenAI-compatible API.** Players craft a unique story by responding to AI-generated scenarios, with their choices directly shaping the narrative, the items they discover, and the world they explore.
+**Fable Mind is an interactive, text-based adventure game powered by an OpenAI-compatible API.** Players craft a unique story by responding to AI-generated scenarios, with their choices directly shaping the narrative, the items they discover, and the world they explore.
 
 ---
 
@@ -29,7 +29,7 @@
 
 *   **Backend:** Go
 *   **Frontend:** HTMX & [a-h/templ](https://github.com/a-h/templ)
-*   **AI Model:** Google Gemini or any OpenAI-compatible Chat Completions endpoint
+*   **AI Model:** Any OpenAI-compatible Chat Completions endpoint
 *   **PDF Generation:** [gofpdf](https://github.com/jung-kurt/gofpdf)
 
 ## 🚀 Getting Started
@@ -38,8 +38,8 @@ Follow these steps to get Story AI running on your local machine.
 
 ### 1. Prerequisites
 
-*   Go 1.21 or later.
-*   A Gemini API key or access to an OpenAI-compatible Chat Completions endpoint.
+*   Go 1.24.5 or later.
+*   Access to an OpenAI-compatible Chat Completions endpoint.
 
 ### 2. Clone the Repository
 
@@ -50,18 +50,9 @@ cd story_ai
 
 ### 3. Set Up Your Environment
 
-Create a `.env` file in the root of the project directory. Gemini remains the default provider:
+Create a `.env` file in the root of the project directory:
 
 ```dotenv
-LLM_PROVIDER=gemini
-GEMINI_API_KEY=your-api-key
-GEMINI_MODEL=gemini-3.1-flash-lite-preview
-```
-
-To use an OpenAI-compatible endpoint instead:
-
-```dotenv
-LLM_PROVIDER=openai
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_API_KEY=your-api-key
 OPENAI_MODEL=gpt-4o-mini
@@ -69,10 +60,13 @@ OPENAI_MODEL=gpt-4o-mini
 
 `OPENAI_BASE_URL` may be either a base API URL or the full `/chat/completions` URL. `OPENAI_API_KEY` may be empty for local endpoints that do not require authentication. `OPENAI_MODEL` is required.
 
+`OPENAI_TEMPERATURE` defaults to `0.65`. `OPENAI_START_MAX_TOKENS` and `OPENAI_TURN_MAX_TOKENS` default to `3000` and `1600`; raise them if a model truncates valid JSON.
+
+`OPENAI_RESPONSE_FORMAT` defaults to `json_object`. Set it to `none` only for compatible endpoints that reject `response_format`; server-side parsing remains strict.
+
 OpenCode Go example:
 
 ```dotenv
-LLM_PROVIDER=openai
 OPENAI_BASE_URL=https://opencode.ai/zen/go/v1
 OPENAI_API_KEY=your-opencode-go-api-key
 OPENAI_MODEL=kimi-k3

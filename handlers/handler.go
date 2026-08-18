@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"story_ai/session"
 	"story_ai/story"
 	"story_ai/templates"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -42,30 +44,38 @@ type NarratorOption struct {
 }
 
 type Handler struct {
-	LLM     llm.Client
-	Manager *session.Manager
+	LLM              llm.Client
+	Manager          *session.Manager
+	DataDatabasePath string
 }
 
 // AIResponse is the top-level structure for the AI's JSON response.
 type AIResponse struct {
-	NewGameState *story.GameState `json:"new_game_state"`
-	StoryUpdate  StoryUpdate      `json:"story_update"`
+	NewGameState *story.GameState  `json:"new_game_state,omitempty"`
+	StatePatch   *story.StatePatch `json:"state_patch,omitempty"`
+	StoryUpdate  StoryUpdate       `json:"story_update"`
 }
 
 // StoryUpdate contains the narrative portion of the AI's response.
 type StoryUpdate struct {
-	Story           string   `json:"story"`
-	ItemsAdded      []string `json:"items_added"`
-	ItemsRemoved    []string `json:"items_removed"`
-	GameOver        bool     `json:"game_over"`
-	BackgroundColor string   `json:"background_color"`
+	Story           string `json:"story"`
+	BackgroundColor string `json:"background_color"`
 }
 
 // AIRequest is the structure sent to the AI.
 type AIRequest struct {
+	Mode       string           `json:"mode"`
 	GameState  *story.GameState `json:"game_state"`
 	UserAction string           `json:"user_action"`
 }
+
+const (
+	defaultStartMaxOutputTokens = 3000
+	defaultTurnMaxOutputTokens  = 1600
+	defaultDataDatabasePath     = "./data.db"
+	responseModeStart           = "start"
+	responseModeTurn            = "turn"
+)
 
 var (
 	authors = []string{"James Joyce", "Mark Twain", "Jack Kerouac", "Kurt Vonnegut", "H.P. Lovecraft", "Edgar Allan Poe", "J.R.R. Tolkien", "Terry Pratchett"}
@@ -75,6 +85,7 @@ var (
 	markdownItalicRegex = regexp.MustCompile(`\*(.*?)\*`)
 	// Regex to fix punctuation outside of span tags
 	spanPunctuationRegex = regexp.MustCompile(`(<span\s+class="[^"]*">(?:.|\n)*?)(</span>)([.,?!])`)
+	fencedJSONRegex      = regexp.MustCompile("(?is)^```(?:json)?\\s*(.*?)\\s*```$")
 )
 
 // validateUserAction validates user input for security and appropriateness
@@ -124,14 +135,38 @@ func contains(slice []string, item string) bool {
 }
 
 // parseAIResponse unmarshals the JSON from the AI and cleans up the story text.
-func parseAIResponse(response string) (AIResponse, error) {
+func parseAIResponse(response, mode string) (AIResponse, error) {
 	var aiResp AIResponse
-	cleanResponse := strings.TrimPrefix(response, "```json\n")
-	cleanResponse = strings.TrimSuffix(cleanResponse, "\n```")
+	cleanResponse := strings.TrimSpace(response)
+	if matches := fencedJSONRegex.FindStringSubmatch(cleanResponse); len(matches) == 2 {
+		cleanResponse = strings.TrimSpace(matches[1])
+	}
 
-	err := json.Unmarshal([]byte(cleanResponse), &aiResp)
-	if err != nil {
+	decoder := json.NewDecoder(strings.NewReader(cleanResponse))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&aiResp); err != nil {
 		return aiResp, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return aiResp, fmt.Errorf("response must contain exactly one JSON object")
+	}
+	switch mode {
+	case responseModeStart:
+		if aiResp.NewGameState == nil {
+			return aiResp, fmt.Errorf("new_game_state is required in start mode")
+		}
+		if aiResp.StatePatch != nil {
+			return aiResp, fmt.Errorf("state_patch is not allowed in start mode")
+		}
+	case responseModeTurn:
+		if aiResp.StatePatch == nil {
+			return aiResp, fmt.Errorf("state_patch is required in turn mode")
+		}
+		if aiResp.NewGameState != nil {
+			return aiResp, fmt.Errorf("new_game_state is not allowed in turn mode")
+		}
+	default:
+		return aiResp, fmt.Errorf("unknown response mode %q", mode)
 	}
 
 	story := aiResp.StoryUpdate.Story
@@ -140,45 +175,80 @@ func parseAIResponse(response string) (AIResponse, error) {
 	story = spanPunctuationRegex.ReplaceAllString(story, "$1$3$2")
 
 	aiResp.StoryUpdate.Story = story
+	if err := validateAndSanitizeStoryUpdate(&aiResp.StoryUpdate); err != nil {
+		return aiResp, err
+	}
 
 	return aiResp, nil
 }
 
-func (h *Handler) parseAndRetryAIResponse(ctx context.Context, systemInstruction, originalResponse string) (AIResponse, error) {
-	log.Printf("RAW AI RESPONSE: %s", originalResponse)
-	aiResp, err := parseAIResponse(originalResponse)
-	if err == nil {
-		return aiResp, nil
+func generationOptions(envName string, fallback int) llm.GenerationOptions {
+	limit, err := strconv.Atoi(strings.TrimSpace(os.Getenv(envName)))
+	if err != nil || limit <= 0 {
+		limit = fallback
 	}
-
-	log.Printf("Initial JSON parsing failed: %v. Retrying with the AI.", err)
-
-	for i := range 3 { // Retry up to 3 times
-		retryPrompt := fmt.Sprintf(prompts.JsonRetryPrompt, originalResponse)
-		correctedResponse, retryErr := h.LLM.Generate(ctx, systemInstruction, retryPrompt)
-		if retryErr != nil {
-			log.Printf("AI retry attempt %d failed: %v", i+1, retryErr)
-			continue
-		}
-
-		aiResp, err = parseAIResponse(correctedResponse)
-		if err == nil {
-			log.Printf("AI successfully corrected the JSON on attempt %d.", i+1)
-			return aiResp, nil
-		}
-		log.Printf("AI retry attempt %d still resulted in invalid JSON: %v", i+1, err)
-		originalResponse = correctedResponse // Use the corrected (but still invalid) response for the next retry
-	}
-
-	return AIResponse{}, fmt.Errorf("failed to parse AI response after multiple retries")
+	return llm.GenerationOptions{MaxOutputTokens: limit}
 }
 
-func prettyPrint(v any) string {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return fmt.Sprintf("Error pretty printing: %v", err)
+func (h *Handler) parseAndRetryAIResponse(ctx context.Context, systemInstruction, originalPrompt, mode string, options llm.GenerationOptions, validate func(AIResponse) error, original llm.Generation) (AIResponse, llm.GenerationStats, error) {
+	stats := original.Stats
+	parseAndValidate := func(text string) (AIResponse, error) {
+		response, err := parseAIResponse(text, mode)
+		if err != nil {
+			return AIResponse{}, err
+		}
+		if validate != nil {
+			if err := validate(response); err != nil {
+				return AIResponse{}, err
+			}
+		}
+		return response, nil
 	}
-	return string(b)
+
+	aiResp, err := parseAndValidate(original.Text)
+	if err == nil {
+		return aiResp, stats, nil
+	}
+
+	reason := responseValidationReason(err)
+	log.Printf("AI response failed validation; retrying once (%s)", reason)
+	retryPrompt := fmt.Sprintf(prompts.JsonRetryPrompt, mode, reason, originalPrompt)
+	correctedResponse, retryErr := h.LLM.Generate(ctx, systemInstruction, retryPrompt, options)
+	stats = stats.Add(correctedResponse.Stats)
+	if retryErr != nil {
+		return AIResponse{}, stats, fmt.Errorf("AI response validation failed and retry request failed: %w", retryErr)
+	}
+	aiResp, err = parseAndValidate(correctedResponse.Text)
+	if err != nil {
+		return AIResponse{}, stats, fmt.Errorf("AI response failed validation after one retry: %s", responseValidationReason(err))
+	}
+	return aiResp, stats, nil
+}
+
+func responseValidationReason(err error) string {
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "story_update"), strings.Contains(message, "background_color"), strings.Contains(message, "story html"), strings.Contains(message, "story exceeds"):
+		return "story_update failed validation"
+	case strings.Contains(message, "json"), strings.Contains(message, "unknown field"), strings.Contains(message, "unmarshal"):
+		return "JSON structure does not match contract"
+	default:
+		return "state transition failed integrity checks"
+	}
+}
+
+func recordGenerationMetrics(provider string, stats llm.GenerationStats, success bool) {
+	metrics.RecordAPIUsage(provider, metrics.APIUsage{
+		PromptTokens:       stats.Usage.PromptTokens,
+		CompletionTokens:   stats.Usage.CompletionTokens,
+		TotalTokens:        stats.Usage.TotalTokens,
+		Duration:           stats.Duration,
+		InputCharacters:    stats.InputCharacters,
+		OutputCharacters:   stats.OutputCharacters,
+		Requests:           stats.Requests,
+		ResponsesWithUsage: stats.ResponsesWithUsage,
+		Success:            success,
+	})
 }
 
 func (h *Handler) buildSystemPrompt(s *session.Session) string {
@@ -247,13 +317,45 @@ func (h *Handler) StartStory(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	sess, cookie := h.Manager.GetOrCreateSession(r)
 	http.SetCookie(w, &cookie)
+	sess.Lock()
+	defer sess.Unlock()
+	previousGameState := sess.GameState
+	previousStoryHistory := sess.StoryHistory
+	previousGenre := sess.CurrentGenre
+	previousAuthor := sess.CurrentAuthor
+	previousPersona := sess.NarratorPersona
+	previousHistoricalEvent := sess.HistoricalEvent
+	previousHistoricalDesc := sess.HistoricalDesc
+	previousHistoricalURL := sess.HistoricalURL
+	previousHistoricalSummary := sess.HistoricalSummary
+	startCommitted := false
+	defer func() {
+		if startCommitted {
+			return
+		}
+		sess.GameState = previousGameState
+		sess.StoryHistory = previousStoryHistory
+		sess.CurrentGenre = previousGenre
+		sess.CurrentAuthor = previousAuthor
+		sess.NarratorPersona = previousPersona
+		sess.HistoricalEvent = previousHistoricalEvent
+		sess.HistoricalDesc = previousHistoricalDesc
+		sess.HistoricalURL = previousHistoricalURL
+		sess.HistoricalSummary = previousHistoricalSummary
+	}()
 
 	genre := r.URL.Query().Get("genre")
 	consequenceModel := r.URL.Query().Get("consequence_model")
+	if genre == "" {
+		genre = "fantasy"
+	}
+	if consequenceModel == "" {
+		consequenceModel = "challenging"
+	}
 
 	// Validate genre parameter
 	validGenres := []string{"fantasy", "sci-fi", "historical-fiction"}
-	if genre != "" && !contains(validGenres, genre) {
+	if !contains(validGenres, genre) {
 		metrics.RecordStoryGeneration(time.Since(startTime), genre, consequenceModel, false)
 		err := fmt.Errorf("invalid genre parameter: %s", genre)
 		handleStartStoryError(w, r, err, ErrorTypeValidation)
@@ -262,14 +364,13 @@ func (h *Handler) StartStory(w http.ResponseWriter, r *http.Request) {
 
 	// Validate consequence model parameter
 	validModels := []string{"exploratory", "challenging", "punishing"}
-	if consequenceModel != "" && !contains(validModels, consequenceModel) {
+	if !contains(validModels, consequenceModel) {
 		metrics.RecordStoryGeneration(time.Since(startTime), genre, consequenceModel, false)
 		err := fmt.Errorf("invalid consequence_model parameter: %s", consequenceModel)
 		handleStartStoryError(w, r, err, ErrorTypeValidation)
 		return
 	}
 
-	sess.GameState.Rules.ConsequenceModel = consequenceModel
 	sess.CurrentGenre = genre
 
 	// Reset story history for a new game
@@ -280,13 +381,16 @@ func (h *Handler) StartStory(w http.ResponseWriter, r *http.Request) {
 
 	sess.CurrentAuthor = author
 	log.Printf("--- NEW STORY --- Author: %s, Genre: %s, Difficulty: %s", author, genre, consequenceModel)
-	go pingStatsService("start", nil)
-
 	var prompt string
 	var inspirationTitle, inspirationDesc string
 
-	db, err := sql.Open("sqlite", "./data.db")
+	databasePath := h.DataDatabasePath
+	if databasePath == "" {
+		databasePath = defaultDataDatabasePath
+	}
+	db, err := sql.Open("sqlite", databasePath)
 	if err != nil {
+		metrics.RecordStoryGeneration(time.Since(startTime), genre, consequenceModel, false)
 		http.Error(w, "Failed to open database.", http.StatusInternalServerError)
 		return
 	}
@@ -296,6 +400,7 @@ func (h *Handler) StartStory(w http.ResponseWriter, r *http.Request) {
 	case "fantasy":
 		err = db.QueryRow("SELECT title, description FROM fantasy_inspo ORDER BY RANDOM() LIMIT 1").Scan(&inspirationTitle, &inspirationDesc)
 		if err != nil {
+			metrics.RecordStoryGeneration(time.Since(startTime), genre, consequenceModel, false)
 			http.Error(w, "Failed to query database for fantasy inspiration.", http.StatusInternalServerError)
 			return
 		}
@@ -304,6 +409,7 @@ func (h *Handler) StartStory(w http.ResponseWriter, r *http.Request) {
 	case "sci-fi":
 		err = db.QueryRow("SELECT title, description FROM scifi_inspo ORDER BY RANDOM() LIMIT 1").Scan(&inspirationTitle, &inspirationDesc)
 		if err != nil {
+			metrics.RecordStoryGeneration(time.Since(startTime), genre, consequenceModel, false)
 			http.Error(w, "Failed to query database for sci-fi inspiration.", http.StatusInternalServerError)
 			return
 		}
@@ -313,18 +419,17 @@ func (h *Handler) StartStory(w http.ResponseWriter, r *http.Request) {
 		var wikipediaURL string
 		err = db.QueryRow("SELECT event, description, wikipedia, summary FROM historical_events ORDER BY RANDOM() LIMIT 1").Scan(&sess.HistoricalEvent, &sess.HistoricalDesc, &wikipediaURL, &sess.HistoricalSummary)
 		if err != nil {
+			metrics.RecordStoryGeneration(time.Since(startTime), genre, consequenceModel, false)
 			http.Error(w, "Failed to query database for historical event.", http.StatusInternalServerError)
 			return
 		}
 		sess.HistoricalURL = wikipediaURL
 		prompt = h.buildSystemPrompt(sess)
 		log.Printf("--- HISTORICAL EVENT --- Event: %s, Description: %s", sess.HistoricalEvent, sess.HistoricalDesc)
-	default:
-		sess.CurrentGenre = "fantasy" // Default to fantasy
-		prompt = h.buildSystemPrompt(sess)
 	}
 
 	initialRequest := AIRequest{
+		Mode: responseModeStart,
 		GameState: &story.GameState{
 			PlayerStatus:      story.PlayerStatus{Health: 100, Stamina: 100, Conditions: make([]string, 0)},
 			Inventory:         make([]story.Item, 0),
@@ -343,36 +448,52 @@ func (h *Handler) StartStory(w http.ResponseWriter, r *http.Request) {
 	}
 	reqBytes, err := json.Marshal(initialRequest)
 	if err != nil {
+		metrics.RecordStoryGeneration(time.Since(startTime), genre, consequenceModel, false)
 		http.Error(w, "Failed to create initial AI request.", http.StatusInternalServerError)
 		return
 	}
 
-	response, err := h.LLM.Generate(context.Background(), prompt, string(reqBytes))
+	options := generationOptions("OPENAI_START_MAX_TOKENS", defaultStartMaxOutputTokens)
+	response, err := h.LLM.Generate(context.Background(), prompt, string(reqBytes), options)
 	if err != nil {
-		log.Printf("AI ERROR (StartStory): %v", err)
+		recordGenerationMetrics(h.LLM.Provider(), response.Stats, false)
+		metrics.RecordStoryGeneration(time.Since(startTime), genre, consequenceModel, false)
+		metrics.RecordError("ai_api_failure")
+		log.Printf("AI request failed while starting story")
 		http.Error(w, "The AI failed to start the story. Please try again.", http.StatusInternalServerError)
 		return
 	}
 
-	aiResp, err := h.parseAndRetryAIResponse(context.Background(), prompt, response)
+	var initialState *story.GameState
+	validateInitialResponse := func(candidate AIResponse) error {
+		validated, err := story.ValidateInitialGameState(candidate.NewGameState, consequenceModel)
+		if err == nil {
+			initialState = validated
+		}
+		return err
+	}
+	aiResp, generationStats, err := h.parseAndRetryAIResponse(context.Background(), prompt, string(reqBytes), responseModeStart, options, validateInitialResponse, response)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to parse AI's initial response: %v", err), http.StatusInternalServerError)
+		recordGenerationMetrics(h.LLM.Provider(), generationStats, false)
+		metrics.RecordStoryGeneration(time.Since(startTime), genre, consequenceModel, false)
+		metrics.RecordError("ai_response_validation")
+		http.Error(w, "The AI returned an invalid story. Please try again.", http.StatusInternalServerError)
 		return
 	}
-
-	// log.Printf("--- NEW GAME STATE (START) --- %s", prettyPrint(aiResp.NewGameState))
 
 	if aiResp.StoryUpdate.BackgroundColor == "" {
 		aiResp.StoryUpdate.BackgroundColor = "#1e1e1e"
 	}
 
-	sess.GameState = aiResp.NewGameState
+	sess.GameState = initialState
 	// The FoundItems list will be empty on start, so no need to update it yet.
 	storyText := aiResp.StoryUpdate.Story
 	if sess.NarratorPersona == "stanley" && !strings.HasPrefix(storyText, "This is the story of a man named Stanley.") {
 		storyText = "This is the story of a man named Stanley.<br><br>" + storyText
 	}
 	sess.StoryHistory = []story.StoryPage{{Prompt: "Start", Response: storyText}}
+	startCommitted = true
+	go pingStatsService("start", nil)
 
 	placeholder := "What do you do?"
 	switch sess.NarratorPersona {
@@ -388,7 +509,8 @@ func (h *Handler) StartStory(w http.ResponseWriter, r *http.Request) {
 		placeholder = "What do I do?"
 	}
 
-	templates.StoryView(storyText, aiResp.NewGameState.PlayerStatus, aiResp.NewGameState.Inventory, aiResp.StoryUpdate.BackgroundColor, genre, aiResp.NewGameState.World.WorldTension, consequenceModel, placeholder).Render(context.Background(), w)
+	recordGenerationMetrics(h.LLM.Provider(), generationStats, true)
+	templates.StoryView(storyText, initialState.PlayerStatus, initialState.Inventory, aiResp.StoryUpdate.BackgroundColor, genre, initialState.World.WorldTension, consequenceModel, placeholder).Render(context.Background(), w)
 
 	// Record successful story generation metrics
 	metrics.RecordStoryGeneration(time.Since(startTime), genre, consequenceModel, true)
@@ -563,29 +685,38 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	sess, _ := h.Manager.GetOrCreateSession(r)
 	userAction := r.FormValue("prompt")
+	sess.Lock()
 
 	// Input validation
 	if err := validateUserAction(userAction); err != nil {
 		handleValidationError(w, r, sess, userAction, err)
+		sess.Unlock()
 		return
 	}
 
 	if strings.ToLower(strings.TrimSpace(userAction)) == "restart" {
 		query := "genre=" + sess.CurrentGenre + "&consequence_model=" + sess.GameState.Rules.ConsequenceModel
+		sess.Unlock()
 		r.URL.RawQuery = query
 		h.StartStory(w, r)
 		return
 	}
+	defer sess.Unlock()
 
-	if len(strings.Fields(userAction)) > 15 {
-		http.Error(w, "Response must be 15 words or less.", http.StatusBadRequest)
+	if sess.GameState == nil || strings.TrimSpace(sess.GameState.Environment.LocationName) == "" {
+		http.Error(w, "Start a story before submitting an action.", http.StatusConflict)
+		return
+	}
+	if sess.GameState.GameWon || sess.GameState.GameLost || sess.GameState.PlayerStatus.Health <= 0 {
+		http.Error(w, "This story is already complete. Restart to begin a new one.", http.StatusConflict)
 		return
 	}
 
 	systemPrompt := h.buildSystemPrompt(sess)
 
 	aiRequest := AIRequest{
-		GameState:  sess.GameState,
+		Mode:       responseModeTurn,
+		GameState:  story.BuildModelContext(sess.GameState, userAction),
 		UserAction: userAction,
 	}
 	reqBytes, err := json.Marshal(aiRequest)
@@ -594,53 +725,46 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := h.LLM.Generate(r.Context(), systemPrompt, string(reqBytes))
+	options := generationOptions("OPENAI_TURN_MAX_TOKENS", defaultTurnMaxOutputTokens)
+	response, err := h.LLM.Generate(r.Context(), systemPrompt, string(reqBytes), options)
 	if err != nil {
-		handleAIError(w, r, sess, userAction, h.LLM.Provider(), err, startTime)
+		handleAIError(w, r, sess, userAction, h.LLM.Provider(), response.Stats, err)
 		return
 	}
 
-	aiResp, err := h.parseAndRetryAIResponse(r.Context(), systemPrompt, response)
+	var updatedState *story.GameState
+	validateTurnResponse := func(candidate AIResponse) error {
+		updated, err := story.ApplyStatePatch(sess.GameState, candidate.StatePatch)
+		if err == nil {
+			updatedState = updated
+		}
+		return err
+	}
+	aiResp, generationStats, err := h.parseAndRetryAIResponse(r.Context(), systemPrompt, string(reqBytes), responseModeTurn, options, validateTurnResponse, response)
 	if err != nil {
+		recordGenerationMetrics(h.LLM.Provider(), generationStats, false)
 		handleSystemError(w, r, sess, userAction, err, ErrorTypeAI)
 		return
 	}
-
-	// log.Printf("--- NEW GAME STATE (GENERATE) --- %s", prettyPrint(aiResp.NewGameState))
 
 	if aiResp.StoryUpdate.BackgroundColor == "" {
 		aiResp.StoryUpdate.BackgroundColor = "#1e1e1e"
 	}
 
-	if aiResp.StoryUpdate.GameOver || aiResp.NewGameState.GameWon {
+	sess.GameState = updatedState
+	gameOver := sess.GameState.GameWon || sess.GameState.GameLost || sess.GameState.PlayerStatus.Health <= 0
+	if gameOver {
 		go pingStatsService("complete", nil)
 	}
 
-	// Merge the AI's proper nouns into the session's master list.
-	existingNouns := make(map[string]bool)
-	for _, noun := range sess.GameState.ProperNouns {
-		existingNouns[noun.Noun] = true
-	}
-	for _, newNoun := range aiResp.NewGameState.ProperNouns {
-		if !existingNouns[newNoun.Noun] {
-			sess.GameState.ProperNouns = append(sess.GameState.ProperNouns, newNoun)
-			existingNouns[newNoun.Noun] = true
-		}
-	}
-
-	// Update the rest of the game state, but preserve our master noun list.
-	updatedNouns := sess.GameState.ProperNouns
-	sess.GameState = aiResp.NewGameState
-	sess.GameState.ProperNouns = updatedNouns
-
-	storyText := aiResp.StoryUpdate.Story // Use nouns from this turn for tooltips
+	storyText := aiResp.StoryUpdate.Story
 	sess.StoryHistory = append(sess.StoryHistory, story.StoryPage{Prompt: userAction, Response: storyText})
 
 	// Record successful AI API usage and user activity metrics
-	metrics.RecordAPIUsage(h.LLM.Provider(), 0, time.Since(startTime), true) // Token count would need to be extracted from AI response
+	recordGenerationMetrics(h.LLM.Provider(), generationStats, true)
 	metrics.RecordUserActivity("generate_response", sess.CurrentGenre, time.Since(startTime))
 
-	templates.Update(sess.StoryHistory, sess.GameState.PlayerStatus, sess.GameState.Inventory, aiResp.StoryUpdate.BackgroundColor, aiResp.StoryUpdate.GameOver, sess.GameState.GameWon, sess.CurrentGenre, sess.GameState.Rules.ConsequenceModel, sess.GameState.World.WorldTension, sess.CurrentAuthor).Render(context.Background(), w)
+	templates.Update(sess.StoryHistory, sess.GameState.PlayerStatus, sess.GameState.Inventory, aiResp.StoryUpdate.BackgroundColor, gameOver, sess.GameState.GameWon, sess.CurrentGenre, sess.GameState.Rules.ConsequenceModel, sess.GameState.World.WorldTension, sess.CurrentAuthor).Render(context.Background(), w)
 }
 
 // writeHtmlToPdf parses a simple HTML string and writes it to the PDF, handling nested styles.
@@ -715,6 +839,8 @@ func writeHtmlToPdf(pdf *gofpdf.Fpdf, htmlStr string) {
 
 func (h *Handler) DownloadStory(w http.ResponseWriter, r *http.Request) {
 	sess, _ := h.Manager.GetOrCreateSession(r)
+	sess.Lock()
+	defer sess.Unlock()
 
 	pdf := gofpdf.New("P", "mm", "A4", "")
 

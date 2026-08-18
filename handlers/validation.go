@@ -2,98 +2,104 @@ package handlers
 
 import (
 	"fmt"
+	htmlstd "html"
 	"regexp"
 	"strings"
-	"unicode"
+
+	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 )
 
-// validateAIResponse validates AI response content for security and appropriateness
-func validateAIResponse(response string) error {
-	// Check for script injection attempts
-	dangerousPatterns := []string{
-		`<script`, `javascript:`, `on\w+\s*=`, `<iframe`, `<object`, `<embed`,
-		`eval\s*\(`, `document\.`, `window\.`, `alert\s*\(`, `prompt\s*\(`,
-		`confirm\s*\(`, `setTimeout\s*\(`, `setInterval\s*\(`,
-		`<img[^>]*src\s*=\s*["'][^"']*javascript:`,
-	}
+const maxStoryHTMLBytes = 16000
 
-	responseLower := strings.ToLower(response)
-	for _, pattern := range dangerousPatterns {
-		if strings.Contains(responseLower, pattern) {
-			return fmt.Errorf("AI response contains potentially harmful content")
-		}
-	}
+var backgroundColorRegex = regexp.MustCompile(`^#[0-9a-fA-F]{6}$`)
 
-	// Check for excessive special characters (might indicate encoding issues)
-	specialChars := 0
-	for _, char := range response {
-		if !unicode.IsLetter(char) && !unicode.IsDigit(char) && !unicode.IsSpace(char) && !unicode.IsPunct(char) {
-			specialChars++
-		}
+func validateAndSanitizeStoryUpdate(update *StoryUpdate) error {
+	if len(update.Story) > maxStoryHTMLBytes {
+		return fmt.Errorf("story exceeds %d bytes", maxStoryHTMLBytes)
 	}
-	if specialChars > len(response)/5 { // More than 20% special characters
-		return fmt.Errorf("AI response contains too many special characters")
+	story, err := sanitizeStoryHTML(update.Story)
+	if err != nil {
+		return err
 	}
-
-	// Check response length
-	if len(response) > 10000 { // 10KB limit
-		return fmt.Errorf("AI response is too long")
+	if strings.TrimSpace(story) == "" {
+		return fmt.Errorf("story_update.story is required")
 	}
-	if len(response) < 10 { // Minimum length
-		return fmt.Errorf("AI response is too short")
+	if update.BackgroundColor != "" && !backgroundColorRegex.MatchString(update.BackgroundColor) {
+		return fmt.Errorf("background_color must be a six-digit hex color")
 	}
-
-	// Check for proper JSON structure if it contains JSON
-	jsonPattern := regexp.MustCompile(`\{.*\}`)
-	if jsonPattern.MatchString(response) {
-		// Basic JSON validation - check for balanced braces
-		openBraces := strings.Count(response, "{")
-		closeBraces := strings.Count(response, "}")
-		if openBraces != closeBraces {
-			return fmt.Errorf("AI response contains malformed JSON structure")
-		}
-	}
-
-	// Check for excessive repetition (might indicate AI hallucination)
-	words := strings.Fields(response)
-	if len(words) > 10 {
-		wordCount := make(map[string]int)
-		for _, word := range words {
-			word = strings.ToLower(strings.Trim(word, ".,!?"))
-			if len(word) > 3 { // Only count meaningful words
-				wordCount[word]++
-			}
-		}
-
-		maxRepetition := 0
-		for _, count := range wordCount {
-			if count > maxRepetition {
-				maxRepetition = count
-			}
-		}
-
-		// If any word is repeated more than 10% of the time, flag it
-		if maxRepetition > len(words)/10 && maxRepetition > 3 {
-			return fmt.Errorf("AI response contains excessive word repetition")
-		}
-	}
-
+	update.Story = story
 	return nil
 }
 
-// sanitizeHTMLContent sanitizes HTML content in AI responses
-func sanitizeHTMLContent(content string) string {
-	// Remove any script tags that might have slipped through
-	scriptRegex := regexp.MustCompile(`(?i)<script[^>]*>.*?</script>`)
-	content = scriptRegex.ReplaceAllString(content, "")
+func sanitizeStoryHTML(content string) (string, error) {
+	contextNode := &html.Node{Type: html.ElementNode, Data: "div", DataAtom: atom.Div}
+	nodes, err := html.ParseFragment(strings.NewReader(content), contextNode)
+	if err != nil {
+		return "", fmt.Errorf("parse story HTML: %w", err)
+	}
 
-	// Remove javascript: URLs
-	jsURLRegex := regexp.MustCompile(`(?i)javascript:[^\s"']*`)
-	content = jsURLRegex.ReplaceAllString(content, "#")
+	var sanitized strings.Builder
+	for _, node := range nodes {
+		renderSanitizedNode(&sanitized, node)
+	}
+	return sanitized.String(), nil
+}
 
-	// Remove event handlers
-	eventRegex := regexp.MustCompile(`(?i)on\w+\s*=\s*["'][^"']*["']`)
-	content = eventRegex.ReplaceAllString(content, "")
+func renderSanitizedNode(output *strings.Builder, node *html.Node) {
+	switch node.Type {
+	case html.TextNode:
+		output.WriteString(htmlstd.EscapeString(node.Data))
+	case html.ElementNode:
+		tag := strings.ToLower(node.Data)
+		switch tag {
+		case "script", "style", "iframe", "object", "embed", "svg", "math":
+			return
+		case "br":
+			output.WriteString("<br>")
+			return
+		case "strong", "em":
+			output.WriteByte('<')
+			output.WriteString(tag)
+			output.WriteByte('>')
+			renderSanitizedChildren(output, node)
+			output.WriteString("</")
+			output.WriteString(tag)
+			output.WriteByte('>')
+			return
+		case "span":
+			if opening, allowed := sanitizedSpanOpening(node); allowed {
+				output.WriteString(opening)
+				renderSanitizedChildren(output, node)
+				output.WriteString("</span>")
+				return
+			}
+		}
+		renderSanitizedChildren(output, node)
+	}
+}
 
-	return content
+func renderSanitizedChildren(output *strings.Builder, node *html.Node) {
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		renderSanitizedNode(output, child)
+	}
+}
+
+func sanitizedSpanOpening(node *html.Node) (string, bool) {
+	className := ""
+	for _, attribute := range node.Attr {
+		if strings.EqualFold(attribute.Key, "class") {
+			className = strings.Join(strings.Fields(attribute.Val), " ")
+			break
+		}
+	}
+
+	switch className {
+	case "item-added", "item-removed", "tooltiptext":
+		return `<span class="` + className + `">`, true
+	case "proper-noun tooltip", "tooltip proper-noun":
+		return `<span class="proper-noun tooltip" tabindex="0">`, true
+	default:
+		return "", false
+	}
 }

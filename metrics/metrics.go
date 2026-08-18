@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -71,7 +72,7 @@ func (mc *MetricsCollector) RecordCounter(name string, value float64, labels map
 
 	// Send to external database if configured
 	if mc.externalURL != "" {
-		go mc.sendToExternal(mc.metrics[key])
+		go mc.sendToExternal(cloneMetric(mc.metrics[key]))
 	}
 }
 
@@ -92,7 +93,7 @@ func (mc *MetricsCollector) SetGauge(name string, value float64, labels map[stri
 
 	// Send to external database if configured
 	if mc.externalURL != "" {
-		go mc.sendToExternal(mc.metrics[key])
+		go mc.sendToExternal(cloneMetric(mc.metrics[key]))
 	}
 }
 
@@ -119,7 +120,7 @@ func (mc *MetricsCollector) RecordHistogram(name string, value float64, labels m
 
 	// Send to external database if configured
 	if mc.externalURL != "" {
-		go mc.sendToExternal(mc.metrics[key])
+		go mc.sendToExternal(cloneMetric(mc.metrics[key]))
 	}
 }
 
@@ -130,7 +131,8 @@ func (mc *MetricsCollector) GetAllMetrics() map[string]*Metric {
 
 	result := make(map[string]*Metric)
 	for k, v := range mc.metrics {
-		result[k] = v
+		metric := cloneMetric(v)
+		result[k] = &metric
 	}
 	return result
 }
@@ -143,7 +145,8 @@ func (mc *MetricsCollector) GetMetricsByName(name string) []*Metric {
 	var result []*Metric
 	for _, metric := range mc.metrics {
 		if metric.Name == name {
-			result = append(result, metric)
+			copy := cloneMetric(metric)
+			result = append(result, &copy)
 		}
 	}
 	return result
@@ -153,7 +156,13 @@ func (mc *MetricsCollector) GetMetricsByName(name string) []*Metric {
 func (mc *MetricsCollector) getMetricKey(name string, labels map[string]string) string {
 	key := name
 	if labels != nil {
-		for k, v := range labels {
+		keys := make([]string, 0, len(labels))
+		for k := range labels {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := labels[k]
 			key += fmt.Sprintf("{%s=%s}", k, v)
 		}
 	}
@@ -161,7 +170,7 @@ func (mc *MetricsCollector) getMetricKey(name string, labels map[string]string) 
 }
 
 // sendToExternal sends a metric to an external database
-func (mc *MetricsCollector) sendToExternal(metric *Metric) {
+func (mc *MetricsCollector) sendToExternal(metric Metric) {
 	if mc.externalURL == "" {
 		return
 	}
@@ -185,6 +194,17 @@ func (mc *MetricsCollector) sendToExternal(metric *Metric) {
 	defer resp.Body.Close()
 
 	// In production, you might want to check resp.StatusCode and handle errors
+}
+
+func cloneMetric(metric *Metric) Metric {
+	copy := *metric
+	if metric.Labels != nil {
+		copy.Labels = make(map[string]string, len(metric.Labels))
+		for key, value := range metric.Labels {
+			copy.Labels[key] = value
+		}
+	}
+	return copy
 }
 
 // Global metrics collector instance
@@ -217,30 +237,58 @@ func RecordStoryGeneration(duration time.Duration, genre string, difficulty stri
 	}
 }
 
-// RecordAPIUsage records AI API usage metrics
-func RecordAPIUsage(provider string, tokens int, duration time.Duration, success bool) {
+// APIUsage describes aggregate model work for one story request.
+type APIUsage struct {
+	PromptTokens       int
+	CompletionTokens   int
+	TotalTokens        int
+	Duration           time.Duration
+	InputCharacters    int
+	OutputCharacters   int
+	Requests           int
+	ResponsesWithUsage int
+	Success            bool
+}
+
+// RecordAPIUsage records AI API usage metrics.
+func RecordAPIUsage(provider string, usage APIUsage) {
 	if defaultCollector == nil {
 		return
 	}
 
 	labels := map[string]string{
 		"provider": provider,
-		"success":  strconv.FormatBool(success),
+		"success":  strconv.FormatBool(usage.Success),
 	}
 
-	defaultCollector.RecordCounter("ai_api_requests_total", 1, labels, "Total number of AI API requests")
-	defaultCollector.RecordHistogram("ai_api_duration", duration.Seconds(), labels, "Duration of AI API calls in seconds")
-	defaultCollector.SetGauge("ai_api_tokens_used", float64(tokens), labels, "Number of tokens used in AI API call")
+	defaultCollector.RecordCounter("ai_api_requests_total", float64(usage.Requests), labels, "Total number of AI API requests")
+	defaultCollector.SetGauge("ai_api_latest_duration_seconds", usage.Duration.Seconds(), labels, "Duration of the latest story request's AI calls")
+	defaultCollector.RecordCounter("ai_api_prompt_tokens_total", float64(usage.PromptTokens), labels, "Prompt tokens reported by AI endpoints")
+	defaultCollector.RecordCounter("ai_api_completion_tokens_total", float64(usage.CompletionTokens), labels, "Completion tokens reported by AI endpoints")
+	defaultCollector.RecordCounter("ai_api_input_characters_total", float64(usage.InputCharacters), labels, "Input characters sent to AI endpoints")
+	defaultCollector.RecordCounter("ai_api_output_characters_total", float64(usage.OutputCharacters), labels, "Output characters returned by AI endpoints")
+	if retries := max(usage.Requests-1, 0); retries > 0 {
+		defaultCollector.RecordCounter("ai_api_retries_total", float64(retries), labels, "AI retry requests")
+	}
+	if usage.ResponsesWithUsage > 0 {
+		defaultCollector.RecordCounter("ai_api_usage_responses_total", float64(usage.ResponsesWithUsage), labels, "AI responses containing token usage")
+	}
+	if missingUsage := max(usage.Requests-usage.ResponsesWithUsage, 0); missingUsage > 0 {
+		defaultCollector.RecordCounter("ai_api_usage_missing_total", float64(missingUsage), labels, "AI responses without token usage")
+	}
+	if usage.ResponsesWithUsage > 0 {
+		defaultCollector.SetGauge("ai_api_latest_tokens_used", float64(usage.TotalTokens), labels, "Tokens reported for the latest story request")
+	}
 
-	if success {
+	if usage.Success {
 		defaultCollector.RecordCounter("ai_api_success_total", 1, labels, "Total number of successful AI API calls")
 	} else {
 		defaultCollector.RecordCounter("ai_api_error_total", 1, labels, "Total number of failed AI API calls")
 	}
 }
 
-// RecordUserActivity records user activity metrics
-func RecordUserActivity(action string, genre string, sessionDuration time.Duration) {
+// RecordUserActivity records user activity metrics.
+func RecordUserActivity(action string, genre string, requestDuration time.Duration) {
 	if defaultCollector == nil {
 		return
 	}
@@ -251,11 +299,11 @@ func RecordUserActivity(action string, genre string, sessionDuration time.Durati
 	}
 
 	defaultCollector.RecordCounter("user_activity_total", 1, labels, "Total number of user actions")
-	defaultCollector.RecordHistogram("user_session_duration", sessionDuration.Seconds(), labels, "Duration of user sessions in seconds")
+	defaultCollector.SetGauge("user_latest_request_duration_seconds", requestDuration.Seconds(), labels, "Duration of latest user request in seconds")
 }
 
-// RecordError records application errors
-func RecordError(errorType string, message string) {
+// RecordError records application errors.
+func RecordError(errorType string) {
 	if defaultCollector == nil {
 		return
 	}

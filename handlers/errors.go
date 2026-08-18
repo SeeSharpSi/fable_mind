@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"fmt"
+	"html"
 	"math/rand"
 	"net/http"
+	"story_ai/llm"
 	"story_ai/metrics"
 	"story_ai/session"
 	"story_ai/story"
@@ -146,55 +148,12 @@ func createErrorPage(userAction string, friendlyError UserFriendlyError) story.S
 	}
 }
 
-// createRetryPage creates a page with retry options
-func createRetryPage(userAction string, originalError string) story.StoryPage {
-	response := fmt.Sprintf(`🤖 The story generator had trouble with your request: "%s"
-
-🔄 Here are some options:
-• Try rephrasing your action
-• Use simpler words
-• Wait a moment and try again
-• Click the "Restart" button to begin a new story
-
-📝 Your original request: "%s"
-
-What would you like to do?`, originalError, userAction)
-
-	return story.StoryPage{
-		Prompt:   userAction,
-		Response: response,
-	}
-}
-
-// handleAIError handles AI-related errors with user-friendly messages and fallback
-func handleAIError(w http.ResponseWriter, r *http.Request, sess *session.Session, userAction, provider string, err error, startTime time.Time) {
+// handleAIError handles AI-related errors without replacing current story state.
+func handleAIError(w http.ResponseWriter, r *http.Request, sess *session.Session, userAction, provider string, generationStats llm.GenerationStats, err error) {
 	// Record metrics
-	metrics.RecordAPIUsage(provider, 0, time.Since(startTime), false)
-	metrics.RecordError("ai_api_failure", err.Error())
+	recordGenerationMetrics(provider, generationStats, false)
+	metrics.RecordError("ai_api_failure")
 
-	// Try fallback story generation for certain types of failures
-	if shouldUseFallback(err) {
-		fallback := &FallbackStoryGenerator{}
-		fallbackResponse, fallbackErr := fallback.GenerateFallbackStory(sess.CurrentGenre, sess.CurrentAuthor)
-		if fallbackErr == nil {
-			// Success with fallback
-			metrics.RecordStoryGeneration(time.Since(startTime), sess.CurrentGenre, sess.GameState.Rules.ConsequenceModel, true)
-
-			fallbackMessage := GetFallbackErrorMessage()
-			fallbackResponse.StoryUpdate.Story = fallbackMessage + "\n\n" + fallbackResponse.StoryUpdate.Story
-
-			sess.GameState = fallbackResponse.NewGameState
-			sess.StoryHistory = []story.StoryPage{{
-				Prompt:   "Start",
-				Response: fallbackResponse.StoryUpdate.Story,
-			}}
-
-			templates.StoryView(fallbackResponse.StoryUpdate.Story, fallbackResponse.NewGameState.PlayerStatus, fallbackResponse.NewGameState.Inventory, fallbackResponse.StoryUpdate.BackgroundColor, sess.CurrentGenre, fallbackResponse.NewGameState.World.WorldTension, sess.GameState.Rules.ConsequenceModel, "Continue the story...").Render(r.Context(), w)
-			return
-		}
-	}
-
-	// Fall back to regular error handling
 	friendlyError := getUserFriendlyError(err, ErrorTypeAI)
 	errorPage := createErrorPage(userAction, friendlyError)
 
@@ -202,22 +161,9 @@ func handleAIError(w http.ResponseWriter, r *http.Request, sess *session.Session
 	templates.Update(sess.StoryHistory, sess.GameState.PlayerStatus, sess.GameState.Inventory, "#1e1e1e", false, false, sess.CurrentGenre, sess.GameState.Rules.ConsequenceModel, sess.GameState.World.WorldTension, sess.CurrentAuthor).Render(r.Context(), w)
 }
 
-// shouldUseFallback determines if we should try fallback generation
-func shouldUseFallback(err error) bool {
-	errMsg := strings.ToLower(err.Error())
-
-	// Use fallback for network issues, quota limits, or service unavailable
-	return strings.Contains(errMsg, "quota") ||
-		strings.Contains(errMsg, "network") ||
-		strings.Contains(errMsg, "timeout") ||
-		strings.Contains(errMsg, "unavailable") ||
-		strings.Contains(errMsg, "rate limit") ||
-		strings.Contains(errMsg, "temporarily")
-}
-
 // handleValidationError handles validation errors
 func handleValidationError(w http.ResponseWriter, r *http.Request, sess *session.Session, userAction string, err error) {
-	metrics.RecordError("input_validation", err.Error())
+	metrics.RecordError("input_validation")
 
 	friendlyError := getUserFriendlyError(err, ErrorTypeValidation)
 	errorPage := createErrorPage(userAction, friendlyError)
@@ -228,7 +174,7 @@ func handleValidationError(w http.ResponseWriter, r *http.Request, sess *session
 
 // handleSystemError handles system-level errors
 func handleSystemError(w http.ResponseWriter, r *http.Request, sess *session.Session, userAction string, err error, errorType ErrorType) {
-	metrics.RecordError(string(errorType), err.Error())
+	metrics.RecordError(string(errorType))
 
 	friendlyError := getUserFriendlyError(err, errorType)
 	errorPage := createErrorPage(userAction, friendlyError)
@@ -240,6 +186,8 @@ func handleSystemError(w http.ResponseWriter, r *http.Request, sess *session.Ses
 // handleStartStoryError handles errors during initial story generation
 func handleStartStoryError(w http.ResponseWriter, r *http.Request, err error, errorType ErrorType) {
 	friendlyError := getUserFriendlyError(err, errorType)
+	safeMessage := html.EscapeString(getRandomErrorResponse(friendlyError.Message))
+	safeSuggestion := html.EscapeString(friendlyError.Suggestion)
 
 	errorHTML := fmt.Sprintf(`
 		<div id="story-container">
@@ -251,7 +199,7 @@ func handleStartStoryError(w http.ResponseWriter, r *http.Request, err error, er
 			</div>
 			<button onclick="window.location.reload()">Try Again</button>
 		</div>
-	`, getRandomErrorResponse(friendlyError.Message), friendlyError.Suggestion,
+	`, safeMessage, safeSuggestion,
 		func() string {
 			if friendlyError.CanRetry {
 				return `<p><em>You can try again by refreshing the page.</em></p>`

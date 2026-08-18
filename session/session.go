@@ -11,6 +11,7 @@ import (
 
 // Session holds the state for a single user's story.
 type Session struct {
+	mutex             sync.Mutex
 	ID                string
 	GameState         *story.GameState
 	StoryHistory      []story.StoryPage
@@ -23,6 +24,16 @@ type Session struct {
 	HistoricalURL     string
 	HistoricalSummary string
 	CSRFToken         string
+}
+
+// Lock serializes access to mutable story state for this session.
+func (s *Session) Lock() {
+	s.mutex.Lock()
+}
+
+// Unlock releases the session story-state lock.
+func (s *Session) Unlock() {
+	s.mutex.Unlock()
 }
 
 // Manager handles the creation, storage, and retrieval of sessions.
