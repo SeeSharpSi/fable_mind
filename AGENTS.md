@@ -12,7 +12,7 @@
 ## Runtime
 
 - `main.go` loads root `.env`. `OPENAI_MODEL` is required. `OPENAI_BASE_URL` accepts a base URL or full `/chat/completions` URL and defaults to OpenAI. `OPENAI_API_KEY` may be empty for local endpoints. Generation defaults are controlled by `OPENAI_TEMPERATURE`, `OPENAI_RESPONSE_FORMAT`, `OPENAI_START_MAX_TOKENS`, and `OPENAI_TURN_MAX_TOKENS`. See `.env.example`.
-- Port defaults to `9779`. `METRICS_DATABASE_URL` and `STATS_SERVICE_URL` default to localhost ports `8081` and `8080`; those companion services are optional, but story activity attempts asynchronous POSTs to them.
+- Port defaults to `9779`. `METRICS_DATABASE_URL` and `STATS_SERVICE_URL` are optional; unset values disable outbound metrics and stats callbacks.
 - `/start` reads inspiration from committed SQLite file `data.db`. Sessions and story history are process-local memory, not SQLite; restart loses active games.
 - `./deploy.sh` targets hard-coded GCP project `gen-lang-client-0878805821`, region `us-east1`, changes active `gcloud` project, enables APIs, builds, and deploys publicly. Never run it without explicit deployment intent.
 

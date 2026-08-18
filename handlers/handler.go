@@ -211,7 +211,7 @@ func (h *Handler) parseAndRetryAIResponse(ctx context.Context, systemInstruction
 	}
 
 	reason := responseValidationReason(err)
-	log.Printf("AI response failed validation; retrying once (%s)", reason)
+	log.Printf("AI response failed validation; retrying once (%s: %v)", reason, err)
 	retryPrompt := fmt.Sprintf(prompts.JsonRetryPrompt, mode, reason, originalPrompt)
 	correctedResponse, retryErr := h.LLM.Generate(ctx, systemInstruction, retryPrompt, options)
 	stats = stats.Add(correctedResponse.Stats)
@@ -977,13 +977,16 @@ func (h *Handler) DownloadStory(w http.ResponseWriter, r *http.Request) {
 	w.Write(pdfBuffer.Bytes())
 }
 
-// pingStatsService sends a POST request to the stats service.
-// For sending PDFs, the pdfData should contain the raw PDF bytes.
+func configuredStatsServiceURL() string {
+	return strings.TrimRight(strings.TrimSpace(os.Getenv("STATS_SERVICE_URL")), "/")
+}
+
+// pingStatsService sends a POST request to the optional stats service. For
+// sending PDFs, pdfData should contain the raw PDF bytes.
 func pingStatsService(endpoint string, pdfData []byte) {
-	statsServiceURL := os.Getenv("STATS_SERVICE_URL") // Get URL from environment variable
+	statsServiceURL := configuredStatsServiceURL()
 	if statsServiceURL == "" {
-		// You can set a default for local testing
-		statsServiceURL = "http://localhost:8080"
+		return
 	}
 
 	url := fmt.Sprintf("%s/%s", statsServiceURL, endpoint)

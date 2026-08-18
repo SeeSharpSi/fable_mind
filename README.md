@@ -64,6 +64,9 @@ OPENAI_MODEL=gpt-4o-mini
 
 `OPENAI_RESPONSE_FORMAT` defaults to `json_object`. Set it to `none` only for compatible endpoints that reject `response_format`; server-side parsing remains strict.
 
+Metrics and stats callbacks are disabled unless `METRICS_DATABASE_URL` and
+`STATS_SERVICE_URL` are explicitly configured.
+
 OpenCode Go example:
 
 ```dotenv

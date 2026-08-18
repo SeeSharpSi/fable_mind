@@ -21,9 +21,6 @@ func main() {
 
 	// Initialize metrics collector
 	metricsURL := os.Getenv("METRICS_DATABASE_URL")
-	if metricsURL == "" {
-		metricsURL = "http://localhost:8081" // Default metrics database URL
-	}
 	metrics.InitDefaultCollector(metricsURL)
 
 	ctx := context.Background()

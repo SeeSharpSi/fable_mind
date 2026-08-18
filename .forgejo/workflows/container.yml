@@ -1,0 +1,53 @@
+name: Build and publish container
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  image:
+    runs-on: docker
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Docker CLI
+        run: apt-get update && apt-get install --yes docker.io
+
+      - name: Validate revision
+        run: |
+          test "${#FORGEJO_SHA}" -eq 40
+          case "$FORGEJO_SHA" in
+            *[!0-9a-f]*) exit 1 ;;
+          esac
+
+      - name: Log in to Forgejo registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" | docker login git.skrittle.net \
+            --username "${{ vars.REGISTRY_USERNAME }}" \
+            --password-stdin
+
+      - name: Build immutable image
+        run: |
+          image="git.skrittle.net/the_rebel_alliance/fable_mind"
+          docker build \
+            --tag "$image:$FORGEJO_SHA" \
+            --label "org.opencontainers.image.source=https://git.skrittle.net/the_rebel_alliance/fable_mind" \
+            --label "org.opencontainers.image.revision=$FORGEJO_SHA" \
+            --label "org.opencontainers.image.version=$FORGEJO_SHA" \
+            --label "io.skrittle.fable=true" \
+            .
+
+      - name: Publish immutable image
+        run: |
+          image="git.skrittle.net/the_rebel_alliance/fable_mind"
+          docker push "$image:$FORGEJO_SHA"
+
+      - name: Publish main channel
+        run: |
+          image="git.skrittle.net/the_rebel_alliance/fable_mind"
+          docker tag "$image:$FORGEJO_SHA" "$image:main"
+          docker push "$image:main"

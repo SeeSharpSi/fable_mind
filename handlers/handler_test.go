@@ -326,3 +326,15 @@ func TestHandleStartStoryErrorEscapesValidationMessage(t *testing.T) {
 		t.Errorf("response contains unescaped validation message: %q", body)
 	}
 }
+
+func TestConfiguredStatsServiceURL(t *testing.T) {
+	t.Setenv("STATS_SERVICE_URL", " https://stats.example.test/ ")
+	if got := configuredStatsServiceURL(); got != "https://stats.example.test" {
+		t.Fatalf("configured URL = %q, want trimmed URL", got)
+	}
+
+	t.Setenv("STATS_SERVICE_URL", "")
+	if got := configuredStatsServiceURL(); got != "" {
+		t.Fatalf("unset configured URL = %q, want empty URL", got)
+	}
+}
