@@ -1,6 +1,6 @@
 # Fable Mind 🤖✍️
 
-**Fable Mind is an interactive, text-based adventure game powered by Google's Gemini API.** Players craft a unique story by responding to AI-generated scenarios, with their choices directly shaping the narrative, the items they discover, and the world they explore.
+**Fable Mind is an interactive, text-based adventure game powered by Gemini or an OpenAI-compatible API.** Players craft a unique story by responding to AI-generated scenarios, with their choices directly shaping the narrative, the items they discover, and the world they explore.
 
 ---
 
@@ -13,7 +13,7 @@
 ## ✨ Features
 
 *   **Systemic, Winnable Gameplay:** The AI acts as a Game Master, managing a persistent world state and presenting solvable challenges. Player agency is paramount.
-*   **Dynamic AI Storytelling:** Powered by Google's Gemini model, every adventure is unique and unpredictable. The story adapts to your choices in real-time.
+*   **Dynamic AI Storytelling:** Powered by your configured language model, every adventure is unique and unpredictable. The story adapts to your choices in real-time.
 *   **Author-Styled Narratives:** Begin your adventure in the literary style of a famous author like J.R.R. Tolkien, H.P. Lovecraft, or Edgar Allan Poe for a unique narrative flavor.
 *   **Selectable Difficulty:** Choose your preferred playstyle:
     *   **Exploratory:** A forgiving mode focused on story and discovery.
@@ -29,7 +29,7 @@
 
 *   **Backend:** Go
 *   **Frontend:** HTMX & [a-h/templ](https://github.com/a-h/templ)
-*   **AI Model:** Google Gemini
+*   **AI Model:** Google Gemini or any OpenAI-compatible Chat Completions endpoint
 *   **PDF Generation:** [gofpdf](https://github.com/jung-kurt/gofpdf)
 
 ## 🚀 Getting Started
@@ -39,7 +39,7 @@ Follow these steps to get Story AI running on your local machine.
 ### 1. Prerequisites
 
 *   Go 1.21 or later.
-*   A Google Gemini API key. You can get one for free from [Google AI Studio](https://aistudio.google.com/app/apikey).
+*   A Gemini API key or access to an OpenAI-compatible Chat Completions endpoint.
 
 ### 2. Clone the Repository
 
@@ -50,13 +50,35 @@ cd story_ai
 
 ### 3. Set Up Your Environment
 
-Create a `.env` file in the root of the project directory. This file will hold your Gemini API key.
+Create a `.env` file in the root of the project directory. Gemini remains the default provider:
 
-```
-GEMINI_API_KEY=YOUR_API_KEY
+```dotenv
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=your-api-key
+GEMINI_MODEL=gemini-3.1-flash-lite-preview
 ```
 
-Replace `YOUR_API_KEY` with your actual Gemini API key.
+To use an OpenAI-compatible endpoint instead:
+
+```dotenv
+LLM_PROVIDER=openai
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=your-api-key
+OPENAI_MODEL=gpt-4o-mini
+```
+
+`OPENAI_BASE_URL` may be either a base API URL or the full `/chat/completions` URL. `OPENAI_API_KEY` may be empty for local endpoints that do not require authentication. `OPENAI_MODEL` is required.
+
+OpenCode Go example:
+
+```dotenv
+LLM_PROVIDER=openai
+OPENAI_BASE_URL=https://opencode.ai/zen/go/v1
+OPENAI_API_KEY=your-opencode-go-api-key
+OPENAI_MODEL=kimi-k3
+```
+
+Use an OpenCode Go model exposed through `/chat/completions`; models available only through Anthropic-compatible `/messages` are not supported by this backend.
 
 ### 4. Run the Application
 

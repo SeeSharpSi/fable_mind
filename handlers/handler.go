@@ -12,6 +12,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"story_ai/llm"
 	"story_ai/metrics"
 	"story_ai/prompts"
 	"story_ai/session"
@@ -22,7 +23,6 @@ import (
 	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/google/generative-ai-go/genai"
 	"github.com/jung-kurt/gofpdf"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -42,7 +42,7 @@ type NarratorOption struct {
 }
 
 type Handler struct {
-	Client  *genai.Client
+	LLM     llm.Client
 	Manager *session.Manager
 }
 
@@ -144,22 +144,7 @@ func parseAIResponse(response string) (AIResponse, error) {
 	return aiResp, nil
 }
 
-func (h *Handler) getModel(systemInstruction string) *genai.GenerativeModel {
-	model := h.Client.GenerativeModel("gemini-3.1-flash-lite-preview")
-	temp := float32(0.9)
-	model.GenerationConfig = genai.GenerationConfig{
-		Temperature:      &temp,
-		ResponseMIMEType: "application/json",
-	}
-	if systemInstruction != "" {
-		model.SystemInstruction = &genai.Content{
-			Parts: []genai.Part{genai.Text(systemInstruction)},
-		}
-	}
-	return model
-}
-
-func (h *Handler) parseAndRetryAIResponse(ctx context.Context, model *genai.GenerativeModel, originalResponse string) (AIResponse, error) {
+func (h *Handler) parseAndRetryAIResponse(ctx context.Context, systemInstruction, originalResponse string) (AIResponse, error) {
 	log.Printf("RAW AI RESPONSE: %s", originalResponse)
 	aiResp, err := parseAIResponse(originalResponse)
 	if err == nil {
@@ -170,22 +155,19 @@ func (h *Handler) parseAndRetryAIResponse(ctx context.Context, model *genai.Gene
 
 	for i := range 3 { // Retry up to 3 times
 		retryPrompt := fmt.Sprintf(prompts.JsonRetryPrompt, originalResponse)
-		resp, retryErr := model.GenerateContent(ctx, genai.Text(retryPrompt))
+		correctedResponse, retryErr := h.LLM.Generate(ctx, systemInstruction, retryPrompt)
 		if retryErr != nil {
 			log.Printf("AI retry attempt %d failed: %v", i+1, retryErr)
 			continue
 		}
 
-		if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
-			correctedResponse := string(resp.Candidates[0].Content.Parts[0].(genai.Text))
-			aiResp, err = parseAIResponse(correctedResponse)
-			if err == nil {
-				log.Printf("AI successfully corrected the JSON on attempt %d.", i+1)
-				return aiResp, nil
-			}
-			log.Printf("AI retry attempt %d still resulted in invalid JSON: %v", i+1, err)
-			originalResponse = correctedResponse // Use the corrected (but still invalid) response for the next retry
+		aiResp, err = parseAIResponse(correctedResponse)
+		if err == nil {
+			log.Printf("AI successfully corrected the JSON on attempt %d.", i+1)
+			return aiResp, nil
 		}
+		log.Printf("AI retry attempt %d still resulted in invalid JSON: %v", i+1, err)
+		originalResponse = correctedResponse // Use the corrected (but still invalid) response for the next retry
 	}
 
 	return AIResponse{}, fmt.Errorf("failed to parse AI response after multiple retries")
@@ -365,16 +347,14 @@ func (h *Handler) StartStory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	model := h.getModel(prompt)
-
-	resp, err := model.GenerateContent(context.Background(), genai.Text(string(reqBytes)))
-	if err != nil || len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+	response, err := h.LLM.Generate(context.Background(), prompt, string(reqBytes))
+	if err != nil {
 		log.Printf("AI ERROR (StartStory): %v", err)
 		http.Error(w, "The AI failed to start the story. Please try again.", http.StatusInternalServerError)
 		return
 	}
 
-	aiResp, err := h.parseAndRetryAIResponse(context.Background(), model, string(resp.Candidates[0].Content.Parts[0].(genai.Text)))
+	aiResp, err := h.parseAndRetryAIResponse(context.Background(), prompt, response)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to parse AI's initial response: %v", err), http.StatusInternalServerError)
 		return
@@ -614,15 +594,13 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	model := h.getModel(systemPrompt)
-
-	resp, err := model.GenerateContent(r.Context(), genai.Text(string(reqBytes)))
-	if err != nil || len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
-		handleAIError(w, r, sess, userAction, err, startTime)
+	response, err := h.LLM.Generate(r.Context(), systemPrompt, string(reqBytes))
+	if err != nil {
+		handleAIError(w, r, sess, userAction, h.LLM.Provider(), err, startTime)
 		return
 	}
 
-	aiResp, err := h.parseAndRetryAIResponse(r.Context(), model, string(resp.Candidates[0].Content.Parts[0].(genai.Text)))
+	aiResp, err := h.parseAndRetryAIResponse(r.Context(), systemPrompt, response)
 	if err != nil {
 		handleSystemError(w, r, sess, userAction, err, ErrorTypeAI)
 		return
@@ -659,7 +637,7 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 	sess.StoryHistory = append(sess.StoryHistory, story.StoryPage{Prompt: userAction, Response: storyText})
 
 	// Record successful AI API usage and user activity metrics
-	metrics.RecordAPIUsage("gemini", 0, time.Since(startTime), true) // Token count would need to be extracted from AI response
+	metrics.RecordAPIUsage(h.LLM.Provider(), 0, time.Since(startTime), true) // Token count would need to be extracted from AI response
 	metrics.RecordUserActivity("generate_response", sess.CurrentGenre, time.Since(startTime))
 
 	templates.Update(sess.StoryHistory, sess.GameState.PlayerStatus, sess.GameState.Inventory, aiResp.StoryUpdate.BackgroundColor, aiResp.StoryUpdate.GameOver, sess.GameState.GameWon, sess.CurrentGenre, sess.GameState.Rules.ConsequenceModel, sess.GameState.World.WorldTension, sess.CurrentAuthor).Render(context.Background(), w)

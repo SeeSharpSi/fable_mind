@@ -7,13 +7,12 @@ import (
 	"os"
 
 	"story_ai/handlers"
+	"story_ai/llm"
 	"story_ai/metrics"
 	"story_ai/session"
 	"story_ai/templates"
 
-	"github.com/google/generative-ai-go/genai"
 	"github.com/joho/godotenv"
-	"google.golang.org/api/option"
 )
 
 func main() {
@@ -28,16 +27,17 @@ func main() {
 	metrics.InitDefaultCollector(metricsURL)
 
 	ctx := context.Background()
-	client, err := genai.NewClient(ctx, option.WithAPIKey(os.Getenv("GEMINI_API_KEY")))
+	aiClient, err := llm.NewFromEnv(ctx)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("initialize LLM: %v", err)
 	}
-	defer client.Close()
+	defer aiClient.Close()
+	log.Printf("Using %s LLM provider", aiClient.Provider())
 
 	sessionManager := session.NewManager()
 
 	h := &handlers.Handler{
-		Client:  client,
+		LLM:     aiClient,
 		Manager: sessionManager,
 	}
 

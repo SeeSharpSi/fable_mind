@@ -167,9 +167,9 @@ What would you like to do?`, originalError, userAction)
 }
 
 // handleAIError handles AI-related errors with user-friendly messages and fallback
-func handleAIError(w http.ResponseWriter, r *http.Request, sess *session.Session, userAction string, err error, startTime time.Time) {
+func handleAIError(w http.ResponseWriter, r *http.Request, sess *session.Session, userAction, provider string, err error, startTime time.Time) {
 	// Record metrics
-	metrics.RecordAPIUsage("gemini", 0, time.Since(startTime), false)
+	metrics.RecordAPIUsage(provider, 0, time.Since(startTime), false)
 	metrics.RecordError("ai_api_failure", err.Error())
 
 	// Try fallback story generation for certain types of failures
