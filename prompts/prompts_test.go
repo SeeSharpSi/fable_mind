@@ -14,6 +14,9 @@ func TestBasePromptContextBudgetAndIntegrityRules(t *testing.T) {
 
 	required := []string{
 		"complete initialized state",
+		"inv[].props and env.objs[].props are arrays of strings",
+		"env.objs[] objects are {name,props?,state?} with no desc",
+		"npcs[] are {name,disp,know?,goal} with no desc",
 		"Every change must directly follow",
 		"Keep win/loss goals and puzzle hints secret",
 		"provide fair clues and opportunities",
