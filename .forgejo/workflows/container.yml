@@ -33,10 +33,10 @@ jobs:
 
       - name: Build immutable image
         run: |
-          image="git.skrittle.net/the_rebel_alliance/fable_mind"
+          image="git.skrittle.net/rebel_alliance/fable_mind"
           docker build \
             --tag "$image:$FORGEJO_SHA" \
-            --label "org.opencontainers.image.source=https://git.skrittle.net/the_rebel_alliance/fable_mind" \
+            --label "org.opencontainers.image.source=https://git.skrittle.net/rebel_alliance/fable_mind" \
             --label "org.opencontainers.image.revision=$FORGEJO_SHA" \
             --label "org.opencontainers.image.version=$FORGEJO_SHA" \
             --label "io.skrittle.fable=true" \
@@ -44,11 +44,11 @@ jobs:
 
       - name: Publish immutable image
         run: |
-          image="git.skrittle.net/the_rebel_alliance/fable_mind"
+          image="git.skrittle.net/rebel_alliance/fable_mind"
           docker push "$image:$FORGEJO_SHA"
 
       - name: Publish main channel
         run: |
-          image="git.skrittle.net/the_rebel_alliance/fable_mind"
+          image="git.skrittle.net/rebel_alliance/fable_mind"
           docker tag "$image:$FORGEJO_SHA" "$image:main"
           docker push "$image:main"
